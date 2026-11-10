@@ -1,10 +1,10 @@
-<table>
+<table border="0" style="background: transparent; border: none;">
   <tr>
-    <td align="center" width="40" bgcolor="#ffffff" style="border-radius: 6px;">
-      <img src="https://cdn.mineshire.com/uploads/cugmzzv6/mcepcm.gif" width="24" height="24" alt="Mineshire" />
+    <td align="center" style="background: transparent; border: none; padding-right: 12px;">
+      <img src="https://cdn.mineshire.com/uploads/cugmzzv6/mcepcm.gif" width="32" height="32" alt="Mineshire" />
     </td>
-    <td>
-      <h1 style="margin: 0; font-size: 24px; border-bottom: none;">Mineshire updates</h1>
+    <td style="background: transparent; border: none; vertical-align: middle;">
+      <h1 style="margin: 0; border-bottom: none; font-size: 28px;">Mineshire updates</h1>
     </td>
   </tr>
 </table>
