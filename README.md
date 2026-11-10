@@ -1,13 +1,11 @@
-<table border="0" style="background: transparent; border: none;">
-  <tr>
-    <td align="center" style="background: transparent; border: none; padding-right: 12px;">
-      <img src="https://cdn.mineshire.com/uploads/cugmzzv6/mcepcm.gif" width="32" height="32" alt="Mineshire" />
-    </td>
-    <td style="background: transparent; border: none; vertical-align: middle;">
-      <h1 style="margin: 0; border-bottom: none; font-size: 28px;">Mineshire updates</h1>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <a href="https://mineshire.com" target="_blank" rel="noopener noreferrer">
+    <img src="https://cdn.mineshire.com/uploads/cugmzzv6/mcepcm.gif" alt="Mineshire" width="120" style="border-radius: 12px; margin-right: 15px;">
+  </a>
+</p>
+
+
+# Mineshire Updates
 
 Installers and update lists for [Mineshire](https://mineshire.com), a launcher that sets up Minecraft servers on your own computer.
 
