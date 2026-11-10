@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to build and publish, for example v26.1110.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: pozii/mineshire-private
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: Build for ${{ matrix.name }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            bundles: nsis
+          - name: macOS
+            os: macos-latest
+            bundles: app,dmg
+            target: --target universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: Linux
+            os: ubuntu-22.04
+            bundles: appimage
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux system packages
+        if: matrix.name == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev libfuse2 patchelf
+
+      - name: The tag must match the app's version
+        run: |
+          app=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$app" != "$TAG" ]; then
+            echo "Tag $TAG does not match the app version $app in src-tauri/tauri.conf.json."
+            exit 1
+          fi
+          echo "VERSION=$app" >> "$GITHUB_ENV"
+
+      - name: Write the app's settings
+        env:
+          APP_ENVIRONMENTS: ${{ secrets.APP_ENVIRONMENTS }}
+        run: |
+          printf '%s\n' "$APP_ENVIRONMENTS" | tr -d '\r' > .env.production
+          for name in VITE_SUPABASE_URL VITE_SUPABASE_PUBLISHABLE_KEY; do
+            if ! grep -Eq "^${name}=.+" .env.production; then
+              echo "The secret APP_ENVIRONMENTS has no ${name} line."
+              exit 1
+            fi
+          done
+
+      - name: Build and sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build --bundles ${{ matrix.bundles }} ${{ matrix.target }}
+
+      - name: Collect the release files
+        run: |
+          mkdir release
+          pick() { ls $1 2>/dev/null | head -n 1; }
+          case "${{ matrix.name }}" in
+            Windows)
+              exe=$(pick "src-tauri/target/release/bundle/nsis/*-setup.exe")
+              cp "$exe" release/Mineshire-setup.exe
+              cp "$exe.sig" release/Mineshire-setup.exe.sig
+              ;;
+            macOS)
+              bundle=src-tauri/target/universal-apple-darwin/release/bundle
+              cp "$(pick "$bundle/dmg/*.dmg")" release/Mineshire-macos.dmg
+              update=$(pick "$bundle/macos/*.app.tar.gz")
+              cp "$update" release/Mineshire-macos.app.tar.gz
+              cp "$update.sig" release/Mineshire-macos.app.tar.gz.sig
+              ;;
+            Linux)
+              image=$(pick "src-tauri/target/release/bundle/appimage/*.AppImage")
+              cp "$image" release/Mineshire-linux.AppImage
+              cp "$image.sig" release/Mineshire-linux.AppImage.sig
+              ;;
+          esac
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            website/content
+            website/tools
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+
+      - name: Write latest.json and the release notes
+        run: |
+          ls -l release
+          node scripts/release-manifest.mjs "${TAG#v}" release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            release/Mineshire-setup.exe release/Mineshire-macos.dmg release/Mineshire-macos.app.tar.gz release/Mineshire-linux.AppImage release/latest.json \
+            --repo "$GITHUB_REPOSITORY" --title "Mineshire ${TAG#v}" --notes-file release/release-notes.md
+
+      - name: Rebuild the site
+        env:
+          SITE_DEPLOY_HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$SITE_DEPLOY_HOOK" ]; then
+            echo "SITE_DEPLOY_HOOK is not set: the site shows the new notes at its next deploy."
+          else
+            curl -fsS -X POST "$SITE_DEPLOY_HOOK" >/dev/null && echo "Asked Vercel to rebuild the site." || echo "::warning::Could not reach the Vercel deploy hook."
+          fi
+
+      - name: Tell Discord about the release
+        continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+        run: |
+          [ -n "$WEBHOOK" ] || { echo "RELEASE_DISCORD_WEBHOOK is not set: nothing posted to Discord."; exit 0; }
+          version="${TAG#v}"
+          notes="$(sed -E 's/^## (.*)$/**\1**/' release/release-notes.md | head -c 3900)"
+          jq -n --arg title "Mineshire $version" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" --arg desc "$notes" \
+            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: $desc, color: 3066993}]}' \
+            | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
