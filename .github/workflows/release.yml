@@ -1,27 +1,75 @@
 name: Release
 
+run-name: ${{ inputs.tag && format('Release {0}', inputs.tag) || 'Release (automatic)' }}
+
 on:
+  schedule:
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: Version tag to build and publish, for example v26.1110.3
-        required: true
+        description: Version tag to build, for example v26.1111.1. Leave empty to pick the newest unreleased tag.
+        required: false
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release
   cancel-in-progress: false
 
 env:
   SOURCE_REPO: pozii/mineshire-private
-  TAG: ${{ inputs.tag }}
 
 jobs:
+  check:
+    name: Find the version to build
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - id: pick
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ]; then
+            echo "tag=$REQUESTED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          candidate=$(GH_TOKEN="$SOURCE_TOKEN" gh api --paginate "repos/$SOURCE_REPO/tags?per_page=100" -q '.[].name' | grep -E "$pattern" | sort -V | tail -n 1 || true)
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' | grep -E "$pattern" | sort -V || true)
+          if [ -z "$candidate" ]; then
+            echo "No version tag in the source repository."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest=$(printf '%s\n%s\n' "$released" "$candidate" | grep -E "$pattern" | sort -V | tail -n 1)
+          if [ "$newest" != "$candidate" ] || printf '%s\n' "$released" | grep -qx "$candidate"; then
+            echo "Nothing new: $candidate is already released."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          since=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          failed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml --status failure --limit 10 --json createdAt -q '.[].createdAt' | awk -v s="$since" '$0 > s' | wc -l)
+          if [ "$failed" -gt 0 ]; then
+            echo "A release run failed in the last 3 hours, so $candidate is not retried automatically. Start it by hand when the cause is fixed."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Building $candidate."
+          echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build for ${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.tag != ''
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
     strategy:
       fail-fast: true
       matrix:
@@ -45,7 +93,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.check.outputs.tag }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
           persist-credentials: false
       - uses: pnpm/action-setup@v6
@@ -131,15 +179,17 @@ jobs:
 
   publish:
     name: Publish
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.check.outputs.tag }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
           persist-credentials: false
           sparse-checkout: |
@@ -190,3 +240,39 @@ jobs:
           jq -n --arg title "Mineshire $version" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" --arg desc "$notes" \
             '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: $desc, color: 3066993}]}' \
             | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+
+  failed:
+    name: Tell Discord that the release failed
+    needs: [check, build, publish]
+    if: failure() && needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+          TAG: ${{ needs.check.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$WEBHOOK" ] || exit 0
+          jq -n --arg title "Release $TAG failed" --arg url "$RUN_URL" \
+            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: "Nothing was published. Open the run to see why. It is not retried by itself for 3 hours.", color: 15158332}]}' \
+            | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+
+  keepalive:
+    name: Keep the schedule switched on
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Make a commit when the repository has been quiet for 30 days
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((30 * 86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keep the schedule alive"
+            git push
+          fi
