@@ -1,0 +1,150 @@
+name: Linux packages
+
+run-name: ${{ inputs.tag && format('Linux packages for {0}', inputs.tag) || 'Linux packages for the latest release' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release that gets the files, for example v26.1114.1. Leave empty for the latest release.
+        required: false
+        type: string
+      source_ref:
+        description: Branch or tag of the source repository to build.
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: pozii/mineshire-private
+
+jobs:
+  check:
+    name: Find the release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build for ${{ matrix.name }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            os: ubuntu-22.04
+            bundles: deb,rpm
+            suffix: ''
+          - name: ARM64
+            os: ubuntu-22.04-arm
+            bundles: appimage,deb,rpm
+            suffix: -arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev libfuse2 patchelf
+
+      - name: Write the app's settings
+        env:
+          APP_ENVIRONMENTS: ${{ secrets.APP_ENVIRONMENTS }}
+        run: |
+          printf '%s\n' "$APP_ENVIRONMENTS" | tr -d '\r' > .env.production
+          for name in VITE_SUPABASE_URL VITE_SUPABASE_PUBLISHABLE_KEY; do
+            if ! grep -Eq "^${name}=.+" .env.production; then
+              echo "The secret APP_ENVIRONMENTS has no ${name} line."
+              exit 1
+            fi
+          done
+
+      - name: Build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Collect the files
+        run: |
+          mkdir release
+          pick() { ls $1 2>/dev/null | head -n 1; }
+          cp "$(pick "src-tauri/target/release/bundle/deb/*.deb")" "release/Mineshire-linux${{ matrix.suffix }}.deb"
+          cp "$(pick "src-tauri/target/release/bundle/rpm/*.rpm")" "release/Mineshire-linux${{ matrix.suffix }}.rpm"
+          if [ "${{ matrix.name }}" = "ARM64" ]; then
+            cp "$(pick "src-tauri/target/release/bundle/appimage/*.AppImage")" release/Mineshire-linux-arm64.AppImage
+          fi
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Attach to the release
+    needs: [check, build]
+    if: ${{ !cancelled() && needs.check.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: release
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l release
+          gh release upload "$TAG" release/* --clobber --repo "$GITHUB_REPOSITORY"
