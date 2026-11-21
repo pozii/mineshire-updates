@@ -104,3 +104,10 @@ jobs:
           gh release create reeve-dev release/* --repo "$GITHUB_REPOSITORY" --prerelease \
             --title "Reeve test build" \
             --notes "A test build of Reeve from ${{ inputs.source_ref }}, not a Mineshire release. Install: curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/reeve-dev/install.sh | sudo sh"
+          gh release edit reeve-dev --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          for try in 1 2 3 4 5 6 7 8; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -L "https://github.com/$GITHUB_REPOSITORY/releases/download/reeve-dev/install.sh")
+            [ "$code" = 200 ] && echo "The install script is reachable." && exit 0
+            sleep 10
+          done
+          echo "::warning::The release was published but its download address does not answer yet."
