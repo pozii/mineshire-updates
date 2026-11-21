@@ -1,0 +1,106 @@
+name: Reeve test build
+
+run-name: Reeve test build of ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or tag of the source repository to build.
+        required: false
+        default: mineshire-revee
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reeve-dev
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: pozii/mineshire-private
+
+jobs:
+  build:
+    name: Build Reeve for ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-22.04
+            file: Mineshire-reeve-linux-x86_64
+          - arch: arm64
+            os: ubuntu-22.04-arm
+            file: Mineshire-reeve-linux-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reeve/daemon
+
+      - name: Build
+        env:
+          APP_ENVIRONMENTS: ${{ secrets.APP_ENVIRONMENTS }}
+        run: |
+          key=$(printf '%s\n' "$APP_ENVIRONMENTS" | tr -d '\r' | sed -n 's/^VITE_SUPABASE_PUBLISHABLE_KEY=//p' | head -n 1)
+          [ -n "$key" ] || { echo "The secret APP_ENVIRONMENTS has no VITE_SUPABASE_PUBLISHABLE_KEY line."; exit 1; }
+          (cd reeve/daemon && REEVE_SUPABASE_KEY="$key" cargo build --release --locked)
+          mkdir release
+          cp reeve/daemon/target/release/reeve "release/${{ matrix.file }}"
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reeve-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the test build
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: reeve/install
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reeve-*
+          merge-multiple: true
+          path: release
+
+      - name: Point the install script at this release
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/reeve-dev"
+          sed "s|DOWNLOAD_URL=\"\${REEVE_DOWNLOAD_URL:-\$BASE_URL/linux}\"|DOWNLOAD_URL=\"\${REEVE_DOWNLOAD_URL:-$base}\"|" reeve/install/install.sh > release/install.sh
+          grep -q "releases/download/reeve-dev" release/install.sh || { echo "The install script was not changed."; exit 1; }
+          sh -n release/install.sh
+          ls -l release
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete reeve-dev --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create reeve-dev release/* --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "Reeve test build" \
+            --notes "A test build of Reeve from ${{ inputs.source_ref }}, not a Mineshire release. Install: curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/reeve-dev/install.sh | sudo sh"
