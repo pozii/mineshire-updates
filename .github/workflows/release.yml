@@ -177,9 +177,73 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  reeve:
+    name: Build Reeve for ${{ matrix.arch }}
+    needs: check
+    if: needs.check.outputs.tag != ''
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-22.04
+            file: Mineshire-reeve-linux-x86_64
+          - arch: arm64
+            os: ubuntu-22.04-arm
+            file: Mineshire-reeve-linux-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reeve/daemon
+
+      - name: Every version file must agree with the tag
+        run: node scripts/version.mjs check "$TAG"
+
+      - name: Build and sign
+        env:
+          APP_ENVIRONMENTS: ${{ secrets.APP_ENVIRONMENTS }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          key=$(printf '%s\n' "$APP_ENVIRONMENTS" | tr -d '\r' | sed -n 's/^VITE_SUPABASE_PUBLISHABLE_KEY=//p' | head -n 1)
+          [ -n "$key" ] || { echo "The secret APP_ENVIRONMENTS has no VITE_SUPABASE_PUBLISHABLE_KEY line."; exit 1; }
+          (cd reeve/daemon && REEVE_SUPABASE_KEY="$key" cargo build --release --locked)
+          mkdir release
+          cp reeve/daemon/target/release/reeve "release/${{ matrix.file }}"
+          pnpm install --frozen-lockfile
+          pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release/${{ matrix.file }}"
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-Reeve-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish
-    needs: [check, build]
+    needs: [check, build, reeve]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check.outputs.tag }}
@@ -210,6 +274,7 @@ jobs:
         run: |
           ls -l release
           node scripts/release-manifest.mjs "${TAG#v}" release
+          node scripts/reeve-manifest.mjs "${TAG#v}" release
 
       - name: Publish release
         env:
@@ -217,6 +282,7 @@ jobs:
         run: |
           gh release create "$TAG" \
             release/Mineshire-setup.exe release/Mineshire-macos.dmg release/Mineshire-macos.app.tar.gz release/Mineshire-linux.AppImage release/latest.json \
+            release/Mineshire-reeve-linux-x86_64 release/Mineshire-reeve-linux-arm64 release/reeve-latest.json \
             --repo "$GITHUB_REPOSITORY" --title "Mineshire ${TAG#v}" --notes-file release/release-notes.md
 
       - name: Rebuild the site
@@ -243,7 +309,7 @@ jobs:
 
   failed:
     name: Tell Discord that the release failed
-    needs: [check, build, publish]
+    needs: [check, build, reeve, publish]
     if: failure() && needs.check.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
