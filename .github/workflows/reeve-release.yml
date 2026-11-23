@@ -1,0 +1,210 @@
+name: Reeve release
+
+run-name: ${{ inputs.tag && format('Reeve release {0}', inputs.tag) || 'Reeve release (automatic)' }}
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Reeve tag to build, for example reeve-R26.1123.2. Leave empty to pick the newest unreleased one.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reeve-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: pozii/mineshire-private
+
+jobs:
+  check:
+    name: Find the Reeve version to build
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - id: pick
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ]; then
+            echo "tag=$REQUESTED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pattern='^reeve-R[0-9]+\.[0-9]+\.[0-9]+$'
+          sorter() { sed 's/^reeve-R//' | sort -V | sed 's/^/reeve-R/'; }
+          candidate=$(GH_TOKEN="$SOURCE_TOKEN" gh api --paginate "repos/$SOURCE_REPO/tags?per_page=100" -q '.[].name' | grep -E "$pattern" | sorter | tail -n 1 || true)
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' | grep -E "$pattern" | sorter || true)
+          if [ -z "$candidate" ]; then
+            echo "No Reeve tag in the source repository."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest=$(printf '%s\n%s\n' "$released" "$candidate" | grep -E "$pattern" | sorter | tail -n 1)
+          if [ "$newest" != "$candidate" ] || printf '%s\n' "$released" | grep -qx "$candidate"; then
+            echo "Nothing new: $candidate is already released."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          since=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          failed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow reeve-release.yml --status failure --limit 10 --json createdAt -q '.[].createdAt' | awk -v s="$since" '$0 > s' | wc -l)
+          if [ "$failed" -gt 0 ]; then
+            echo "A Reeve release run failed in the last 3 hours, so $candidate is not retried automatically. Start it by hand when the cause is fixed."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Building $candidate."
+          echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Reeve for ${{ matrix.arch }}
+    needs: check
+    if: needs.check.outputs.tag != ''
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-22.04
+            file: Mineshire-reeve-linux-x86_64
+          - arch: arm64
+            os: ubuntu-22.04-arm
+            file: Mineshire-reeve-linux-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reeve/daemon
+
+      - name: The tag, the program's version and the changelog must agree
+        run: node scripts/reeve-version.mjs check "$TAG"
+
+      - name: Build and sign
+        env:
+          APP_ENVIRONMENTS: ${{ secrets.APP_ENVIRONMENTS }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          key=$(printf '%s\n' "$APP_ENVIRONMENTS" | tr -d '\r' | sed -n 's/^VITE_SUPABASE_PUBLISHABLE_KEY=//p' | head -n 1)
+          [ -n "$key" ] || { echo "The secret APP_ENVIRONMENTS has no VITE_SUPABASE_PUBLISHABLE_KEY line."; exit 1; }
+          (cd reeve/daemon && REEVE_SUPABASE_KEY="$key" cargo build --release --locked)
+          mkdir release
+          cp reeve/daemon/target/release/reeve "release/${{ matrix.file }}"
+          pnpm install --frozen-lockfile
+          pnpm tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release/${{ matrix.file }}"
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reeve-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            reeve/changelog.md
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reeve-*
+          merge-multiple: true
+          path: release
+
+      - name: Write the manifest and the release notes
+        run: |
+          version="${TAG#reeve-R}"
+          node scripts/reeve-manifest.mjs "$version" release
+          node scripts/reeve-version.mjs notes "$version" release/release-notes.md
+          ls -l release
+
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" \
+            release/Mineshire-reeve-linux-x86_64 release/Mineshire-reeve-linux-arm64 release/reeve-latest.json \
+            --repo "$GITHUB_REPOSITORY" --latest=false --title "Reeve R${TAG#reeve-R}" --notes-file release/release-notes.md
+
+      - name: Move the newest Reeve to the fixed address
+        run: |
+          if ! gh release view reeve-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create reeve-latest --repo "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --title "Reeve, newest" --notes "The newest Reeve and its update file, kept at a fixed address. Each version has its own release."
+          fi
+          gh release upload reeve-latest \
+            release/Mineshire-reeve-linux-x86_64 release/Mineshire-reeve-linux-arm64 release/reeve-latest.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Tell Discord about the release
+        continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+        run: |
+          [ -n "$WEBHOOK" ] || { echo "RELEASE_DISCORD_WEBHOOK is not set: nothing posted to Discord."; exit 0; }
+          notes="$(sed -E 's/^## (.*)$/**\1**/' release/release-notes.md | head -c 3900)"
+          jq -n --arg title "Reeve R${TAG#reeve-R}" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" --arg desc "$notes" \
+            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: $desc, color: 3066993}]}' \
+            | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+
+  failed:
+    name: Tell Discord that the Reeve release failed
+    needs: [check, build, publish]
+    if: failure() && needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+          TAG: ${{ needs.check.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$WEBHOOK" ] || exit 0
+          jq -n --arg title "Reeve release $TAG failed" --arg url "$RUN_URL" \
+            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: "Nothing was published. Open the run to see why. It is not retried by itself for 3 hours.", color: 15158332}]}' \
+            | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
