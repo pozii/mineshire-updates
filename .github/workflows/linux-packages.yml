@@ -52,10 +52,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: x86_64
-            os: ubuntu-22.04
-            bundles: deb,rpm
-            suffix: ''
           - name: ARM64
             os: ubuntu-22.04-arm
             bundles: appimage,deb,rpm
