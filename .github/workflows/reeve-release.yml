@@ -181,30 +181,30 @@ jobs:
             release/Mineshire-reeve-linux-x86_64 release/Mineshire-reeve-linux-arm64 release/reeve-latest.json \
             --repo "$GITHUB_REPOSITORY" --clobber
 
-      - name: Tell Discord about the release
+      - name: Tell Slack about the release
         continue-on-error: true
         env:
-          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+          WEBHOOK: ${{ secrets.RELEASE_SLACK_WEBHOOK }}
         run: |
-          [ -n "$WEBHOOK" ] || { echo "RELEASE_DISCORD_WEBHOOK is not set: nothing posted to Discord."; exit 0; }
-          notes="$(sed -E 's/^## (.*)$/**\1**/' release/release-notes.md | head -c 3900)"
-          jq -n --arg title "Reeve R${TAG#reeve-R}" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" --arg desc "$notes" \
-            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: $desc, color: 3066993}]}' \
+          [ -n "$WEBHOOK" ] || { echo "RELEASE_SLACK_WEBHOOK is not set: nothing posted to Slack."; exit 0; }
+          notes="$(sed -E -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/^## (.*)$/*\1*/' -e 's/^- /• /' release/release-notes.md)"
+          jq -n --arg title "Reeve R${TAG#reeve-R}" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" --arg notes "$notes" \
+            '{text: "*<\($url)|\($title)>*\n\n\($notes[0:3900])", unfurl_links: false, unfurl_media: false}' \
             | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
 
   failed:
-    name: Tell Discord that the Reeve release failed
+    name: Tell Slack that the Reeve release failed
     needs: [check, build, publish]
     if: failure() && needs.check.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - continue-on-error: true
         env:
-          WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+          WEBHOOK: ${{ secrets.RELEASE_SLACK_WEBHOOK }}
           TAG: ${{ needs.check.outputs.tag }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$WEBHOOK" ] || exit 0
           jq -n --arg title "Reeve release $TAG failed" --arg url "$RUN_URL" \
-            '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, description: "Nothing was published. Open the run to see why. It is not retried by itself for 3 hours.", color: 15158332}]}' \
+            '{text: ":red_circle: *<\($url)|\($title)>*\nNothing was published. Open the run to see why. It is not retried by itself for 3 hours.", unfurl_links: false, unfurl_media: false}' \
             | curl -sS --fail -H 'Content-Type: application/json' -d @- "$WEBHOOK"
